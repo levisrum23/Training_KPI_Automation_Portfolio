@@ -1,40 +1,75 @@
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine
 from pathlib import Path
+from datetime import datetime
 
-def load_data():
+# --- NEW DATA LOADING FUNCTION ---
+@st.cache_data  # This "caches" the data, so we only run this slow ETL once.
+def run_etl_pipeline():
     """
-    Function to load data from the SQLite database.
-    We use @st.cache_data to speed up the app by only loading
-    the data once.
+    This function runs the entire ETL process in-memory
+    by reading the raw Excel files from the 'inputs' folder.
     """
-    # Define the path to the database
-    db_path = Path.cwd() / "outputs" / "ld_database.db"
+    print("RUNNING IN-MEMORY ETL...") # You'll see this in the Streamlit logs
     
-    # Check if the database file exists
-    if not db_path.exists():
-        st.error(f"Error: Database file not found at {db_path}")
-        st.error("Please run `process_report.py` first to create the database.")
-        return pd.DataFrame() # Return an empty DataFrame
+    # --- 1. DEFINE "TODAY" ---
+    TODAY = pd.to_datetime('2025-10-28')
+    REPORT_MONTH_STR = TODAY.strftime('%Y-%m')
+    
+    # --- 2. EXTRACT ---
+    input_dir = Path.cwd() / "inputs"
+    df_roster = pd.read_excel(input_dir / "Employee_Roster.xlsx")
+    df_log = pd.read_excel(input_dir / "Training_Log_2025.xlsx")
+    df_goals = pd.read_excel(input_dir / "Department_Goals.xlsx")
+    
+    # --- 3. TRANSFORM: CLEAN & PREP ---
+    df_log['Course_Date'] = pd.to_datetime(df_log['Course_Date'])
 
-    try:
-        engine = create_engine(f"sqlite:///{db_path}")
-        
-        # Read the entire kpi_history table
-        df = pd.read_sql('SELECT * FROM kpi_history', con=engine)
-        
-        # Convert % column back to a numeric float for charting
-        df['YTD_Achievement_Percent'] = pd.to_numeric(df['YTD_Achievement_Percent'], errors='coerce')
-        
-        return df
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return pd.DataFrame()
+    # --- 4. TRANSFORM: JOIN & ENRICH ---
+    df_merged = pd.merge(
+        df_log,
+        df_roster[['Employee_ID', 'Department']],
+        on='Employee_ID',
+        how='left'
+    )
+    
+    # --- 5. TRANSFORM: FILTER & AGGREGATE ---
+    is_this_year = (df_merged['Course_Date'].dt.year == TODAY.year)
+    is_this_month = (df_merged['Course_Date'].dt.month == TODAY.month)
+
+    df_ytd_data = df_merged[is_this_year]
+    df_mtd_data = df_merged[is_this_year & is_this_month]
+
+    ytd_hours = df_ytd_data.groupby('Department')['Duration_Hours'].sum().rename('YTD_Hours')
+    mtd_hours = df_mtd_data.groupby('Department')['Duration_Hours'].sum().rename('MTD_Hours')
+
+    # --- 6. TRANSFORM: BUILD FINAL REPORT ---
+    df_kpi_summary = pd.merge(
+        ytd_hours,
+        mtd_hours,
+        on='Department',
+        how='outer'
+    ).fillna(0)
+    
+    df_kpi_report = pd.merge(
+        df_goals,
+        df_kpi_summary,
+        on='Department',
+        how='left'
+    ).fillna(0)
+
+    # Calculate the final KPI
+    df_kpi_report['YTD_Achievement_Percent'] = (
+        df_kpi_report['YTD_Hours'] / df_kpi_report['Target_Man_Hours_YTD']
+    )
+    
+    # Add a 'Report_Month' column
+    df_kpi_report['Report_Month'] = REPORT_MONTH_STR
+    
+    return df_kpi_report
 
 def main():
     # --- 1. Page Configuration ---
-    # This should be the first streamlit command
     st.set_page_config(
         page_title="L&D KPI Dashboard",
         page_icon="📊",
@@ -42,10 +77,12 @@ def main():
     )
 
     # --- 2. Load Data ---
-    df = load_data()
+    # Now, we just call our new ETL function
+    df = run_etl_pipeline()
 
     if df.empty:
-        st.stop() # Stop the script if data loading failed
+        st.error("Data loading failed. Check 'inputs' folder.")
+        st.stop() 
 
     # --- 3. Page Title ---
     st.title("L&D Key Performance Indicator (KPI) Dashboard")
@@ -70,7 +107,6 @@ def main():
     # --- 5. Main Page Metrics (KPIs) ---
     st.subheader(f"Summary for: {selected_month}")
     
-    # Calculate overall metrics
     total_ytd_hours = df_filtered['YTD_Hours'].sum()
     total_mtd_hours = df_filtered['MTD_Hours'].sum()
     
@@ -91,6 +127,7 @@ def main():
         df_filtered,
         x='Department',
         y='YTD_Achievement_Percent'
+        # 'tooltip' argument removed for compatibility
     )
     st.caption("This chart shows the total YTD hours as a percentage of the annual target.")
 
@@ -102,7 +139,7 @@ def main():
     df_filtered_display['YTD_Achievement_Percent'] = df_filtered_display['YTD_Achievement_Percent'].map('{:.1%}'.format)
     
     # Display the final table
-    st.dataframe(df_filtered_display.drop(columns=['YTD_Achievement_Formatted']))
+    st.dataframe(df_filtered_display.drop(columns=['YTD_Achievement_Formatted'], errors='ignore'))
 
 
 if __name__ == "__main__":
